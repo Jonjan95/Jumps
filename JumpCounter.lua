@@ -923,7 +923,7 @@ local function Me()
     local wid = CurrentWeekId()
     local me = { total = 0, week = 0, weekId = wid, deaths = 0, rate = { jumps = 0, seconds = 0 },
         challengeXP = acct.challengeXP + (acct.duelXP or 0) + (acct.crownXP or 0) + (acct.dailyXP or 0)
-            + (acct.weeklyXP or 0),
+            + (acct.weeklyXP or 0) + (acct.restoredXP or 0),
         prestige = acct.prestige, prestigeSpent = acct.prestigeSpent, done = acct.done,
         duelWins = acct.duelWins or 0, duelPoints = acct.duelPoints or 0, faction = MyFaction(),
         duelBest = acct.stats and acct.stats.bestDuel or 0,
@@ -2244,12 +2244,23 @@ function CheckChallenges()
     acct.stats.bestLevel = math.max(acct.stats.bestLevel or 0, knownLevel or 0,
         (acct.prestige or 0) > 0 and PRESTIGE_LEVEL or 0)
     local completed, xp = {}, 0
+    local paid = {}                   -- challenge name -> XP it gives now
     for _, c in ipairs(CHALLENGES) do
         if not acct.done[c.id] and c.progress() >= c.goal then
             acct.done[c.id] = time()
             acct.challengeXP = acct.challengeXP + c.xp
+            -- Restored after a reinstall (see Daily.RestoreFromBackup): the old XP
+            -- already includes the challenges done back then, but not which
+            -- ones they were. Until you're back at that many, a challenge
+            -- done again is paid out of the restored XP, so it isn't paid twice.
+            local back = 0
+            if (acct.restoredXP or 0) > 0 and CountCompleted(acct) <= (acct.restoredChallenges or 0) then
+                back = math.min(c.xp, acct.restoredXP)
+                acct.restoredXP = acct.restoredXP - back
+            end
+            paid[c.name] = c.xp - back
             table.insert(completed, c.name)
-            xp = xp + c.xp
+            xp = xp + c.xp - back
         end
     end
     if #completed > 0 then
@@ -2257,17 +2268,15 @@ function CheckChallenges()
         if settings.myProgress then
             if #completed <= 2 then
                 for _, name in ipairs(completed) do
-                    for _, c in ipairs(CHALLENGES) do
-                        if c.name == name then
-                            Notify(GOLD:format(("Challenge complete: %s (+%s XP)")
-                                :format(name, BreakUpLargeNumbers(c.xp))), true)
-                        end
-                    end
+                    Notify(GOLD:format(paid[name] > 0
+                        and ("Challenge complete: %s (+%s XP)"):format(name, BreakUpLargeNumbers(paid[name]))
+                        or ("Challenge complete: %s (already in your restored XP)"):format(name)), true)
                 end
             else
                 -- Several at once (e.g. new challenges you already qualify for).
-                Notify(GOLD:format(("%d challenges complete (+%s XP)!"):format(#completed,
-                    BreakUpLargeNumbers(xp))), true)
+                Notify(GOLD:format(xp > 0
+                    and ("%d challenges complete (+%s XP)!"):format(#completed, BreakUpLargeNumbers(xp))
+                    or ("%d challenges complete (already in your restored XP)!"):format(#completed)), true)
                 Print(table.concat(completed, ", "))
             end
         end
@@ -5519,6 +5528,94 @@ local function OnPlayerDead()
 end
 
 ---------------------------------------------------------------------------
+-- Restores after a reinstall (1.8.16). A new Windows or a fresh WoW folder
+-- wipes the saved data; friends' saved copies still have the account's
+-- numbers. Each restore below was taken from a friend's copy and is applied
+-- once, on that player's own install only (recognised by a character's
+-- GUID, or a character's name on the same server). Jumps made since the
+-- reinstall are kept and the old numbers are added to them. The list of
+-- completed challenges isn't in friends' copies, so the old bonus XP comes
+-- back as one amount (acct.restoredXP), and challenges done again are paid
+-- from it until you're back at the old number (see CheckChallenges).
+-- (Kept in the Daily table: the file is at Lua's limit of 200 locals.)
+---------------------------------------------------------------------------
+function Daily.RestoreFromBackup()
+    if acct.restoredFrom then return end
+    local RESTORES = {
+        {   -- Akropil Restorange, from a copy saved 23 Nov 2026 13:05
+            acct = "188c40411667", server = "6938", taken = "23 November",
+            chars = {
+                { guid = "Player-6938-0026044F", name = "Akropil", display = "Akropil Restorange", total = 28317 },
+                { name = "Monopol", display = "Monopol Banken", total = 828 },
+                { name = "H\195\165rding", display = "H\195\165rding Tording", total = 360 },
+                { guid = "Player-6938-07A0F3D4", name = "Pil", display = "Pil Skjutare", total = 226, class = "HUNTER" },
+            },
+            xp = 64631, prestige = 2, prestigeSpent = 40986, challenges = 50, deaths = 118,
+            duelWins = 44, duelLosses = 52, duelDraws = 18, duelPoints = 163, crowns = 14,
+            bestDuel = 33, bestCombo = 55,
+        },
+    }
+    local guid = UnitGUID("player") or ""
+    local server = guid:match("^Player%-(%d+)%-")
+    local name = UnitName("player")
+    local r
+    for _, cand in ipairs(RESTORES) do
+        for _, ch in ipairs(cand.chars) do
+            if ch.guid == guid or (ch.name == name and cand.server == server) then r = cand end
+        end
+    end
+    if not r or acct.id == r.acct then return end   -- not them, or their data was never lost
+    local oldJumps = 0
+    for _, ch in ipairs(r.chars) do oldJumps = oldJumps + ch.total end
+    if Me().total >= oldJumps then return end        -- already further than the copy
+
+    -- Characters: add the old jumps to the one on this install (by GUID or
+    -- name), or keep them for one not logged in yet: by GUID when we know
+    -- it, else under "Name-Realm", which is moved to the GUID at its first
+    -- login (InitDB).
+    local db = JumpCounterDB
+    for i, ch in ipairs(r.chars) do
+        local entry = ch.guid and db.chars[ch.guid]
+        if not entry then
+            for _, c in pairs(db.chars) do if c.name == ch.name then entry = c end end
+        end
+        if not entry then
+            entry = { total = 0, name = ch.name, class = ch.class }
+            db.chars[ch.guid or (ch.name .. "-" .. MyRealm())] = entry
+        end
+        entry.total = (entry.total or 0) + ch.total
+        entry.display = entry.display or ch.display
+        if i == 1 then entry.deaths = (entry.deaths or 0) + r.deaths end
+    end
+
+    -- The account: the old bonus XP (all but jumps) less the challenge XP
+    -- earned since the reinstall, which is the same challenges done again.
+    acct.restoredXP = math.max(0, r.xp - oldJumps - (acct.challengeXP or 0))
+    acct.restoredChallenges = r.challenges
+    acct.prestige = (acct.prestige or 0) + r.prestige
+    acct.prestigeSpent = (acct.prestigeSpent or 0) + r.prestigeSpent
+    acct.duelWins = (acct.duelWins or 0) + r.duelWins
+    acct.duelLosses = (acct.duelLosses or 0) + r.duelLosses
+    acct.duelDraws = (acct.duelDraws or 0) + r.duelDraws
+    acct.duelPoints = (acct.duelPoints or 0) + r.duelPoints
+    acct.crowns = (acct.crowns or 0) + r.crowns
+    acct.stats.bestDuel = math.max(acct.stats.bestDuel or 0, r.bestDuel)
+    acct.stats.bestCombo = math.max(acct.stats.bestCombo or 0, r.bestCombo)
+    -- The old account id: friends' rows for the old and new install become one.
+    acct.restoredFrom, acct.id = acct.id, r.acct
+    dirty = true
+    C_Timer.After(7, function()
+        local me = Me()
+        Print(GOLD:format(("Welcome back! Your progress from before your reinstall (as your friends "
+            .. "had it saved on %s) is restored: %s jumps, jump level %d, %d prestige %s, %d duel wins "
+            .. "and %d crowns. Jumps since your reinstall are kept on top."):format(r.taken, Fmt(me.total),
+            (EntryLevel(me)), acct.prestige, acct.prestige == 1 and "star" or "stars", acct.duelWins, acct.crowns)))
+        Print(("Which challenges you had done couldn't be restored - doing them again is free "
+            .. "(the XP is already in your total) until you're back at %d."):format(r.challenges))
+    end)
+end
+
+---------------------------------------------------------------------------
 -- Slash commands
 ---------------------------------------------------------------------------
 SLASH_JUMPCOUNTER1 = "/jumps"
@@ -5781,6 +5878,8 @@ events:SetScript("OnEvent", function(_, event, ...)
                 end)
             end
         end
+        -- 1.8.16: give back a friend's progress after a reinstall wiped it.
+        Daily.RestoreFromBackup()
         knownLevel = EntryLevel(Me())
         LearnMyNameFromUnit()
         -- Stats combined from several characters (or new challenges) may

@@ -3,6 +3,10 @@
 All changes to Jumps, newest first. The addon updates itself through the CurseForge app;
 after an update, type `/reload` in game (or restart the game when the notes say so).
 
+## [1.8.16] - 2026-11-25
+
+- **Progress restored after a reinstall:** a player whose saved progress was wiped by a fresh Windows install gets it back, as their friends had it saved. Jumps made since the reinstall are kept on top. Challenges done again are free until they're back where they were, since their XP is already in the restored total.
+
 ## [1.8.15] - 2026-11-14
 
 - **Special jumps:** the on-screen counter now notices when you land a jump in a special way and calls it out next to your combo. The Overview tab keeps count. (Most can't be seen inside dungeons, raids and battlegrounds.)
